@@ -10,9 +10,6 @@ on:
         required: false
         type: string
 
-permissions:
-  contents: write  # Required for pushing changes
-
 jobs:
   sync-forks:
     runs-on: ubuntu-latest
@@ -20,11 +17,9 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          
+      
       - name: Setup GitHub CLI
-        uses: actions/setup-node@v4  # We'll use npm to install gh cli
+        uses: actions/setup-node@v4
         with:
           node-version: '20'
           
@@ -44,17 +39,27 @@ jobs:
           
       - name: Get list of forks and sync them
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # Using default token
+          GITHUB_TOKEN: ${{ secrets.SYNC_TOKEN }}  # Use your PAT here
           SPECIFIC_REPO: ${{ github.event.inputs.specific_repo }}
         run: |
+          # Authenticate with GitHub CLI using the token
+          echo "$GITHUB_TOKEN" | gh auth login --with-token
+          
           # Get list of your forks
           if [ -z "$SPECIFIC_REPO" ]; then
+            echo "Fetching all fork repositories..."
             FORKS=$(gh repo list --fork --json name -q '.[].name')
           else
+            echo "Using specified repository: $SPECIFIC_REPO"
             FORKS="$SPECIFIC_REPO"
           fi
           
           echo "Found forks: $FORKS"
+          
+          if [ -z "$FORKS" ]; then
+            echo "No forks found. Please check your GitHub account or token permissions."
+            exit 0
+          fi
           
           # Process each fork
           for repo in $FORKS; do
@@ -65,21 +70,26 @@ jobs:
             cd $TEMP_DIR
             
             # Clone the fork
-            gh repo clone "${{ github.repository_owner }}/$repo" || continue
+            gh repo clone "${{ github.repository_owner }}/$repo" || { echo "Failed to clone $repo"; continue; }
             cd "$repo"
             
             # Get upstream URL
             UPSTREAM_URL=$(gh api "repos/${{ github.repository_owner }}/$repo" --jq '.parent.clone_url')
             
-            if [ ! -z "$UPSTREAM_URL" ]; then
+            if [ -n "$UPSTREAM_URL" ]; then
               echo "Syncing $repo with upstream $UPSTREAM_URL"
               
               # Add upstream and sync
               git remote add upstream "$UPSTREAM_URL"
               git fetch upstream
-              git checkout main || git checkout master
-              git merge upstream/main || git merge upstream/master
-              git push origin main || git push origin master
+              DEFAULT_BRANCH=$(git symbolic-ref --short HEAD || echo "main")
+              echo "Default branch is $DEFAULT_BRANCH"
+              
+              UPSTREAM_DEFAULT=$(git ls-remote --symref upstream HEAD | grep -oP 'refs/heads/\K[^\s]+' || echo "main")
+              echo "Upstream default branch is $UPSTREAM_DEFAULT"
+              
+              git merge "upstream/$UPSTREAM_DEFAULT" -m "Sync with upstream"
+              git push origin $DEFAULT_BRANCH
               
               echo "Successfully synced $repo"
             else
@@ -87,6 +97,6 @@ jobs:
             fi
             
             # Cleanup
-            cd ../..
+            cd ../../
             rm -rf "$TEMP_DIR"
           done
