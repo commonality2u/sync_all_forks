@@ -15,6 +15,9 @@ on:
         type: boolean
         default: false
 
+permissions:
+  contents: write
+
 jobs:
   sync-forks:
     runs-on: ubuntu-latest
@@ -211,7 +214,7 @@ jobs:
               cd ../..
               rm -rf "$TEMP_DIR"
               continue
-            }
+            fi
             
             # Get upstream URL with error handling
             echo "Getting upstream URL for $repo..."
@@ -313,7 +316,7 @@ jobs:
                  git merge "upstream/$UPSTREAM_DEFAULT" --allow-unrelated-histories -m "Sync with upstream (unrelated histories)" --quiet 2>merge_error2.log; then
                 SYNC_SUCCESS=true
               else
-                merge_error2=$(cat merge_error2.log)
+                merge_error2=$(cat merge_error2.log 2>/dev/null || echo "No error output")
                 echo "Merge with --allow-unrelated-histories failed: $merge_error2"
                 
                 # Strategy 3: Force sync if requested (reset to upstream)
@@ -325,7 +328,7 @@ jobs:
                     echo "Force-synced with upstream using hard reset"
                     echo "Warning: Force-synced with upstream using hard reset" >> "$REPORT_FILE"
                   else
-                    reset_error=$(cat reset_error.log)
+                    reset_error=$(cat reset_error.log 2>/dev/null || echo "No error output")
                     echo "Force sync failed: $reset_error"
                   fi
                 fi
@@ -357,7 +360,7 @@ jobs:
                 echo "Status: Successfully synced (pushed changes)" >> "$REPORT_FILE"
                 SUCCESSFUL_SYNCS=$((SUCCESSFUL_SYNCS+1))
               else
-                push_error=$(cat push_error.log)
+                push_error=$(cat push_error.log 2>/dev/null || echo "No error output")
                 echo "Push attempt $push_attempts failed: $push_error"
                 
                 if [[ "$push_error" == *"rate limit"* ]]; then
