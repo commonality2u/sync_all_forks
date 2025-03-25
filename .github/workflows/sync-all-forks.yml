@@ -9,10 +9,16 @@ on:
         description: 'Specific repository to sync (leave empty for all)'
         required: false
         type: string
+      force_sync:
+        description: 'Force sync even if there are conflicts (use with caution)'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   sync-forks:
     runs-on: ubuntu-latest
+    timeout-minutes: 60  # Set a timeout to prevent hanging jobs
     
     steps:
       - name: Checkout repository
@@ -36,91 +42,370 @@ jobs:
         run: |
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          # Set longer timeouts for operations
+          git config --global http.lowSpeedLimit 1000
+          git config --global http.lowSpeedTime 60
+          git config --global core.compression 0  # Better for unstable connections
           
       - name: Get list of forks and sync them
         env:
           SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
           SPECIFIC_REPO: ${{ github.event.inputs.specific_repo }}
+          FORCE_SYNC: ${{ github.event.inputs.force_sync }}
+          GH_REPO_OWNER: ${{ github.repository_owner }}
         run: |
+          # Create a sync report file for logging results
+          REPORT_FILE=$(mktemp)
+          echo "# Fork Sync Report - $(date)" > "$REPORT_FILE"
+          echo "" >> "$REPORT_FILE"
+          
+          # Set up error handling
+          handle_error() {
+            echo "ERROR: $1" | tee -a "$REPORT_FILE"
+            # Continue execution despite errors
+            return 0
+          }
+          
           # Create temp token file for authentication (avoids env var conflicts)
           TOKEN_FILE=$(mktemp)
           echo "$SYNC_TOKEN" > "$TOKEN_FILE"
+          chmod 600 "$TOKEN_FILE"
           
           # Unset GitHub token env var to avoid conflicts
           unset GITHUB_TOKEN
           
           # Authenticate with token file
-          gh auth login --with-token < "$TOKEN_FILE"
-          rm "$TOKEN_FILE"  # Delete token file immediately after use
+          echo "Authenticating with GitHub..."
+          if ! gh auth login --with-token < "$TOKEN_FILE"; then
+            handle_error "Failed to authenticate with GitHub"
+            rm -f "$TOKEN_FILE"
+            exit 1
+          fi
+          rm -f "$TOKEN_FILE"  # Delete token file immediately after use
           
-          # Get list of your forks
+          # Verify authentication worked
+          if ! gh auth status; then
+            handle_error "GitHub authentication verification failed"
+            exit 1
+          fi
+          
+          # Configure git to use HTTPS with credential helper that uses the token for auth
+          git config --global credential.helper store
+          echo "https://x-access-token:$SYNC_TOKEN@github.com" > ~/.git-credentials
+          chmod 600 ~/.git-credentials
+          
+          # Get list of your forks with retry logic for API rate limiting
+          MAX_RETRIES=3
+          RETRY_DELAY=5
+          
+          get_forks_with_retry() {
+            local retries=0
+            local result=""
+            
+            while [ $retries -lt $MAX_RETRIES ]; do
+              echo "Fetching fork repositories (attempt $((retries+1))/$MAX_RETRIES)..."
+              result=$(gh repo list "$GH_REPO_OWNER" --fork --json name,parent -q '.[] | select(.parent != null) | .name' 2>&1)
+              
+              if [ $? -eq 0 ]; then
+                echo "$result"
+                return 0
+              fi
+              
+              if [[ "$result" == *"rate limit"* ]]; then
+                echo "API rate limit hit, waiting $RETRY_DELAY seconds before retry..."
+                sleep $RETRY_DELAY
+                retries=$((retries+1))
+                RETRY_DELAY=$((RETRY_DELAY*2))  # Exponential backoff
+              else
+                handle_error "Failed to fetch fork repositories: $result"
+                return 1
+              fi
+            done
+            
+            handle_error "Maximum retries reached when fetching forks"
+            return 1
+          }
+          
           if [ -z "$SPECIFIC_REPO" ]; then
-            echo "Fetching all fork repositories..."
-            FORKS=$(gh repo list --fork --json name -q '.[].name')
+            FORKS=$(get_forks_with_retry)
+            if [ $? -ne 0 ]; then
+              exit 1
+            fi
           else
             echo "Using specified repository: $SPECIFIC_REPO"
             FORKS="$SPECIFIC_REPO"
           fi
           
           echo "Found forks: $FORKS"
+          echo "Found forks: $FORKS" >> "$REPORT_FILE"
+          echo "" >> "$REPORT_FILE"
           
           if [ -z "$FORKS" ]; then
             echo "No forks found. Please check your GitHub account or token permissions."
+            echo "No forks found. Please check your GitHub account or token permissions." >> "$REPORT_FILE"
             exit 0
           fi
           
+          # Initialize counters for summary
+          TOTAL_REPOS=0
+          SUCCESSFUL_SYNCS=0
+          FAILED_SYNCS=0
+          ALREADY_SYNCED=0
+          
           # Process each fork
           for repo in $FORKS; do
+            TOTAL_REPOS=$((TOTAL_REPOS+1))
+            echo "--------------------------------------"
             echo "Processing $repo..."
+            echo "## Repository: $repo" >> "$REPORT_FILE"
             
-            # Create temporary directory
-            TEMP_DIR=$(mktemp -d)
-            cd $TEMP_DIR
-            
-            # Clone the fork
-            gh repo clone "${{ github.repository_owner }}/$repo" || { echo "Failed to clone $repo"; continue; }
-            cd "$repo"
-            
-            # Get upstream URL
-            UPSTREAM_URL=$(gh api "repos/${{ github.repository_owner }}/$repo" --jq '.parent.clone_url')
-            
-            if [ -n "$UPSTREAM_URL" ]; then
-              echo "Syncing $repo with upstream $UPSTREAM_URL"
-              
-              # Check if upstream remote already exists and update it
-              if git remote | grep -q "^upstream$"; then
-                echo "Upstream remote already exists, updating it"
-                git remote set-url upstream "$UPSTREAM_URL"
-              else
-                echo "Adding upstream remote"
-                git remote add upstream "$UPSTREAM_URL"
-              fi
-              
-              # Fetch from upstream
-              git fetch upstream
-              
-              # Get default branches
-              DEFAULT_BRANCH=$(git symbolic-ref --short HEAD || echo "main")
-              echo "Default branch is $DEFAULT_BRANCH"
-              
-              UPSTREAM_DEFAULT=$(git ls-remote --symref upstream HEAD | grep -oP 'refs/heads/\K[^\s]+' || echo "main")
-              echo "Upstream default branch is $UPSTREAM_DEFAULT"
-              
-              # Merge changes
-              git merge "upstream/$UPSTREAM_DEFAULT" -m "Sync with upstream" || {
-                echo "Merge conflict detected. Will try with --allow-unrelated-histories"
-                git merge "upstream/$UPSTREAM_DEFAULT" --allow-unrelated-histories -m "Sync with upstream"
-              }
-              
-              # Push changes
-              git push origin $DEFAULT_BRANCH
-              
-              echo "Successfully synced $repo"
-            else
-              echo "Could not find upstream for $repo"
+            # Create temporary directory with error handling
+            TEMP_DIR=$(mktemp -d 2>/dev/null || handle_error "Failed to create temporary directory")
+            if [ ! -d "$TEMP_DIR" ]; then
+              FAILED_SYNCS=$((FAILED_SYNCS+1))
+              echo "Error: Failed to create temporary directory" >> "$REPORT_FILE"
+              continue
             fi
             
+            cd "$TEMP_DIR" || { 
+              handle_error "Failed to navigate to temporary directory"
+              FAILED_SYNCS=$((FAILED_SYNCS+1))
+              echo "Error: Failed to navigate to temporary directory" >> "$REPORT_FILE"
+              continue
+            }
+            
+            # Clone the fork with token and error handling
+            echo "Cloning $repo..."
+            if ! git clone --quiet "https://x-access-token:$SYNC_TOKEN@github.com/$GH_REPO_OWNER/$repo.git" 2>clone_error.log; then
+              error_msg=$(cat clone_error.log)
+              handle_error "Failed to clone $repo: $error_msg"
+              FAILED_SYNCS=$((FAILED_SYNCS+1))
+              echo "Error: Failed to clone repository - $error_msg" >> "$REPORT_FILE"
+              cd ..
+              rm -rf "$TEMP_DIR"
+              continue
+            fi
+            
+            if [ ! -d "$repo" ]; then
+              handle_error "Repository directory not found after cloning"
+              FAILED_SYNCS=$((FAILED_SYNCS+1))
+              echo "Error: Repository directory not found after cloning" >> "$REPORT_FILE"
+              cd ..
+              rm -rf "$TEMP_DIR"
+              continue
+            fi
+            
+            cd "$repo" || {
+              handle_error "Failed to navigate to repository directory"
+              FAILED_SYNCS=$((FAILED_SYNCS+1))
+              echo "Error: Failed to navigate to repository directory" >> "$REPORT_FILE"
+              cd ../..
+              rm -rf "$TEMP_DIR"
+              continue
+            }
+            
+            # Check if repository is empty (no commits)
+            if ! git rev-parse HEAD &>/dev/null; then
+              echo "Repository is empty (no commits), skipping"
+              echo "Status: Skipped - Repository is empty (no commits)" >> "$REPORT_FILE"
+              cd ../..
+              rm -rf "$TEMP_DIR"
+              continue
+            }
+            
+            # Get upstream URL with error handling
+            echo "Getting upstream URL for $repo..."
+            UPSTREAM_URL=$(gh api "repos/$GH_REPO_OWNER/$repo" --jq '.parent.clone_url' 2>api_error.log)
+            if [ $? -ne 0 ] || [ -z "$UPSTREAM_URL" ]; then
+              error_msg=$(cat api_error.log)
+              handle_error "Failed to get upstream URL for $repo: $error_msg"
+              FAILED_SYNCS=$((FAILED_SYNCS+1))
+              echo "Error: Failed to get upstream URL - $error_msg" >> "$REPORT_FILE"
+              cd ../..
+              rm -rf "$TEMP_DIR"
+              continue
+            fi
+            
+            echo "Found upstream: $UPSTREAM_URL"
+            echo "Upstream: $UPSTREAM_URL" >> "$REPORT_FILE"
+            
+            # Convert HTTPS URL to use token
+            UPSTREAM_AUTH_URL=$(echo "$UPSTREAM_URL" | sed 's|https://|https://x-access-token:'"$SYNC_TOKEN"'@|')
+            
+            # Check if upstream remote already exists and update it
+            if git remote | grep -q "^upstream$"; then
+              echo "Upstream remote already exists, updating it"
+              git remote set-url upstream "$UPSTREAM_AUTH_URL"
+            else
+              echo "Adding upstream remote"
+              git remote add upstream "$UPSTREAM_AUTH_URL"
+            fi
+            
+            # Fetch from upstream with error handling
+            echo "Fetching from upstream..."
+            if ! git fetch upstream --quiet 2>fetch_error.log; then
+              error_msg=$(cat fetch_error.log)
+              handle_error "Failed to fetch from upstream: $error_msg"
+              FAILED_SYNCS=$((FAILED_SYNCS+1))
+              echo "Error: Failed to fetch from upstream - $error_msg" >> "$REPORT_FILE"
+              cd ../..
+              rm -rf "$TEMP_DIR"
+              continue
+            fi
+            
+            # Get default branches with error handling
+            DEFAULT_BRANCH=$(git symbolic-ref --short HEAD 2>/dev/null || echo "main")
+            echo "Default branch is $DEFAULT_BRANCH"
+            
+            # Fallback chain for upstream default branch detection
+            UPSTREAM_DEFAULT=""
+            
+            # Method 1: Using symref
+            UPSTREAM_DEFAULT=$(git ls-remote --symref upstream HEAD 2>/dev/null | grep -oP 'refs/heads/\K[^\s]+' 2>/dev/null)
+            
+            # Method 2: Check common branch names if Method 1 failed
+            if [ -z "$UPSTREAM_DEFAULT" ]; then
+              for branch in main master develop trunk; do
+                if git ls-remote upstream "refs/heads/$branch" 2>/dev/null | grep -q .; then
+                  UPSTREAM_DEFAULT="$branch"
+                  break
+                fi
+              done
+            fi
+            
+            # Method 3: Last resort, use fork's default branch
+            if [ -z "$UPSTREAM_DEFAULT" ]; then
+              UPSTREAM_DEFAULT="$DEFAULT_BRANCH"
+              echo "Warning: Could not determine upstream default branch, using $UPSTREAM_DEFAULT"
+            fi
+            
+            echo "Upstream default branch is $UPSTREAM_DEFAULT"
+            echo "Local branch: $DEFAULT_BRANCH | Upstream branch: $UPSTREAM_DEFAULT" >> "$REPORT_FILE"
+            
+            # Check if already up to date to avoid unnecessary merges
+            LOCAL_HEAD=$(git rev-parse HEAD)
+            UPSTREAM_HEAD=$(git rev-parse "upstream/$UPSTREAM_DEFAULT" 2>/dev/null)
+            
+            if [ "$LOCAL_HEAD" = "$UPSTREAM_HEAD" ]; then
+              echo "Already up to date with upstream. No sync needed."
+              echo "Status: Already in sync" >> "$REPORT_FILE"
+              ALREADY_SYNCED=$((ALREADY_SYNCED+1))
+              cd ../..
+              rm -rf "$TEMP_DIR"
+              continue
+            fi
+            
+            # Merge changes with extensive error handling
+            echo "Merging changes from upstream/$UPSTREAM_DEFAULT..."
+            
+            # Try different merge strategies based on situation
+            SYNC_SUCCESS=false
+            
+            # Strategy 1: Simple merge
+            if git merge "upstream/$UPSTREAM_DEFAULT" -m "Sync with upstream" --quiet 2>merge_error.log; then
+              SYNC_SUCCESS=true
+            else
+              merge_error=$(cat merge_error.log)
+              echo "Simple merge failed: $merge_error"
+              
+              # Strategy 2: Try with allow-unrelated-histories
+              if git merge --abort &>/dev/null && \
+                 git merge "upstream/$UPSTREAM_DEFAULT" --allow-unrelated-histories -m "Sync with upstream (unrelated histories)" --quiet 2>merge_error2.log; then
+                SYNC_SUCCESS=true
+              else
+                merge_error2=$(cat merge_error2.log)
+                echo "Merge with --allow-unrelated-histories failed: $merge_error2"
+                
+                # Strategy 3: Force sync if requested (reset to upstream)
+                if [ "$FORCE_SYNC" = "true" ]; then
+                  echo "Force sync requested. Resetting to upstream state."
+                  if git merge --abort &>/dev/null && \
+                     git reset --hard "upstream/$UPSTREAM_DEFAULT" 2>reset_error.log; then
+                    SYNC_SUCCESS=true
+                    echo "Force-synced with upstream using hard reset"
+                    echo "Warning: Force-synced with upstream using hard reset" >> "$REPORT_FILE"
+                  else
+                    reset_error=$(cat reset_error.log)
+                    echo "Force sync failed: $reset_error"
+                  fi
+                fi
+              fi
+            fi
+            
+            if [ "$SYNC_SUCCESS" = "false" ]; then
+              handle_error "All merge strategies failed for $repo"
+              FAILED_SYNCS=$((FAILED_SYNCS+1))
+              echo "Error: All merge strategies failed" >> "$REPORT_FILE"
+              cd ../..
+              rm -rf "$TEMP_DIR"
+              continue
+            fi
+            
+            # Push changes with retry logic
+            echo "Pushing changes to origin $DEFAULT_BRANCH..."
+            push_attempts=0
+            push_max_attempts=3
+            push_success=false
+            
+            while [ $push_attempts -lt $push_max_attempts ] && [ "$push_success" = "false" ]; do
+              push_attempts=$((push_attempts+1))
+              echo "Push attempt $push_attempts of $push_max_attempts"
+              
+              if git push origin $DEFAULT_BRANCH --quiet 2>push_error.log; then
+                push_success=true
+                echo "Successfully synced $repo"
+                echo "Status: Successfully synced (pushed changes)" >> "$REPORT_FILE"
+                SUCCESSFUL_SYNCS=$((SUCCESSFUL_SYNCS+1))
+              else
+                push_error=$(cat push_error.log)
+                echo "Push attempt $push_attempts failed: $push_error"
+                
+                if [[ "$push_error" == *"rate limit"* ]]; then
+                  sleep 30  # Wait longer for rate limit issues
+                elif [[ "$push_error" == *"network"* || "$push_error" == *"timeout"* ]]; then
+                  sleep 10  # Wait for network issues
+                else
+                  sleep 5   # General retry delay
+                fi
+              fi
+            done
+            
+            if [ "$push_success" = "false" ]; then
+              handle_error "Failed to push changes after $push_max_attempts attempts"
+              FAILED_SYNCS=$((FAILED_SYNCS+1))
+              echo "Error: Failed to push changes after $push_max_attempts attempts" >> "$REPORT_FILE"
+            fi
+            
+            # Add empty line in report
+            echo "" >> "$REPORT_FILE"
+            
             # Cleanup
-            cd ../../
+            cd ../..
             rm -rf "$TEMP_DIR"
           done
+          
+          # Generate summary
+          echo "--------------------------------------"
+          echo "## Sync Summary" >> "$REPORT_FILE"
+          echo "- Total repositories processed: $TOTAL_REPOS" | tee -a "$REPORT_FILE"
+          echo "- Successfully synced: $SUCCESSFUL_SYNCS" | tee -a "$REPORT_FILE"
+          echo "- Already in sync: $ALREADY_SYNCED" | tee -a "$REPORT_FILE"
+          echo "- Failed to sync: $FAILED_SYNCS" | tee -a "$REPORT_FILE"
+          echo "--------------------------------------"
+          
+          # Clean up credentials
+          rm -f ~/.git-credentials
+          
+          # Output the full report
+          echo "Full sync report:"
+          cat "$REPORT_FILE"
+          
+          # Clean up report file
+          rm -f "$REPORT_FILE"
+          
+          # Return appropriate exit code
+          if [ $FAILED_SYNCS -gt 0 ]; then
+            echo "Warning: Some repositories failed to sync."
+            # We still exit with 0 to not mark the whole job as failed
+            # since partial success is still valuable
+          fi
