@@ -39,11 +39,19 @@ jobs:
           
       - name: Get list of forks and sync them
         env:
-          GITHUB_TOKEN: ${{ secrets.SYNC_TOKEN }}  # Use your PAT here
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
           SPECIFIC_REPO: ${{ github.event.inputs.specific_repo }}
         run: |
-          # Authenticate with GitHub CLI using the token
-          echo "$GITHUB_TOKEN" | gh auth login --with-token
+          # Create temp token file for authentication (avoids env var conflicts)
+          TOKEN_FILE=$(mktemp)
+          echo "$SYNC_TOKEN" > "$TOKEN_FILE"
+          
+          # Unset GitHub token env var to avoid conflicts
+          unset GITHUB_TOKEN
+          
+          # Authenticate with token file
+          gh auth login --with-token < "$TOKEN_FILE"
+          rm "$TOKEN_FILE"  # Delete token file immediately after use
           
           # Get list of your forks
           if [ -z "$SPECIFIC_REPO" ]; then
