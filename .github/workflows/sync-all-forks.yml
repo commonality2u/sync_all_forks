@@ -10,6 +10,10 @@ on:
         required: false
         type: string
 
+permissions:
+  contents: write  # Required for pushing changes
+  metadata: read   # Required for accessing repository information
+
 jobs:
   sync-forks:
     runs-on: ubuntu-latest
@@ -17,10 +21,23 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        
+        with:
+          fetch-depth: 0
+          
       - name: Setup GitHub CLI
-        uses: cli/setup-gh@v1
-        
+        uses: actions/setup-node@v4  # We'll use npm to install gh cli
+        with:
+          node-version: '20'
+          
+      - name: Install GitHub CLI
+        run: |
+          type -p curl >/dev/null || (sudo apt update && sudo apt install curl -y)
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
+          && sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
+          && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
+          && sudo apt update \
+          && sudo apt install gh -y
+          
       - name: Configure Git
         run: |
           git config --global user.name 'github-actions[bot]'
@@ -28,20 +45,20 @@ jobs:
           
       - name: Get list of forks and sync them
         env:
-          GITHUB_TOKEN: ${{ secrets.SYNC_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # Using default token since we set permissions above
           SPECIFIC_REPO: ${{ github.event.inputs.specific_repo }}
         run: |
           # Get list of your forks
           if [ -z "$SPECIFIC_REPO" ]; then
-            FORKS=$(gh api user/repos --paginate --jq 'map(select(.fork == true)) | map(.name)')
+            FORKS=$(gh repo list --fork --json name -q '.[].name')
           else
-            FORKS="[\"$SPECIFIC_REPO\"]"
+            FORKS="$SPECIFIC_REPO"
           fi
           
           echo "Found forks: $FORKS"
           
           # Process each fork
-          echo "$FORKS" | jq -r '.[]' | while read repo; do
+          for repo in $FORKS; do
             echo "Processing $repo..."
             
             # Create temporary directory
