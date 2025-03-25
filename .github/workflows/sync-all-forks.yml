@@ -1,0 +1,76 @@
+name: Sync All Forks
+
+on:
+  schedule:
+    - cron: '0 */12 * * *'  # Runs every 12 hours
+  workflow_dispatch:  # Allows manual triggering
+    inputs:
+      specific_repo:
+        description: 'Specific repository to sync (leave empty for all)'
+        required: false
+        type: string
+
+jobs:
+  sync-forks:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        
+      - name: Setup GitHub CLI
+        uses: cli/setup-gh@v1
+        
+      - name: Configure Git
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          
+      - name: Get list of forks and sync them
+        env:
+          GITHUB_TOKEN: ${{ secrets.SYNC_TOKEN }}
+          SPECIFIC_REPO: ${{ github.event.inputs.specific_repo }}
+        run: |
+          # Get list of your forks
+          if [ -z "$SPECIFIC_REPO" ]; then
+            FORKS=$(gh api user/repos --paginate --jq 'map(select(.fork == true)) | map(.name)')
+          else
+            FORKS="[\"$SPECIFIC_REPO\"]"
+          fi
+          
+          echo "Found forks: $FORKS"
+          
+          # Process each fork
+          echo "$FORKS" | jq -r '.[]' | while read repo; do
+            echo "Processing $repo..."
+            
+            # Create temporary directory
+            TEMP_DIR=$(mktemp -d)
+            cd $TEMP_DIR
+            
+            # Clone the fork
+            gh repo clone "${{ github.repository_owner }}/$repo" || continue
+            cd "$repo"
+            
+            # Get upstream URL
+            UPSTREAM_URL=$(gh api "repos/${{ github.repository_owner }}/$repo" --jq '.parent.clone_url')
+            
+            if [ ! -z "$UPSTREAM_URL" ]; then
+              echo "Syncing $repo with upstream $UPSTREAM_URL"
+              
+              # Add upstream and sync
+              git remote add upstream "$UPSTREAM_URL"
+              git fetch upstream
+              git checkout main || git checkout master
+              git merge upstream/main || git merge upstream/master
+              git push origin main || git push origin master
+              
+              echo "Successfully synced $repo"
+            else
+              echo "Could not find upstream for $repo"
+            fi
+            
+            # Cleanup
+            cd ..
+            rm -rf "$repo"
+          done
