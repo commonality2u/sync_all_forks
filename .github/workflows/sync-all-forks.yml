@@ -12,7 +12,6 @@ on:
 
 permissions:
   contents: write  # Required for pushing changes
-  metadata: read   # Required for accessing repository information
 
 jobs:
   sync-forks:
@@ -45,7 +44,7 @@ jobs:
           
       - name: Get list of forks and sync them
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # Using default token since we set permissions above
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # Using default token
           SPECIFIC_REPO: ${{ github.event.inputs.specific_repo }}
         run: |
           # Get list of your forks
@@ -88,6 +87,6 @@ jobs:
             fi
             
             # Cleanup
-            cd ..
-            rm -rf "$repo"
+            cd ../..
+            rm -rf "$TEMP_DIR"
           done
