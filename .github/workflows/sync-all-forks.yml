@@ -87,16 +87,32 @@ jobs:
             if [ -n "$UPSTREAM_URL" ]; then
               echo "Syncing $repo with upstream $UPSTREAM_URL"
               
-              # Add upstream and sync
-              git remote add upstream "$UPSTREAM_URL"
+              # Check if upstream remote already exists and update it
+              if git remote | grep -q "^upstream$"; then
+                echo "Upstream remote already exists, updating it"
+                git remote set-url upstream "$UPSTREAM_URL"
+              else
+                echo "Adding upstream remote"
+                git remote add upstream "$UPSTREAM_URL"
+              fi
+              
+              # Fetch from upstream
               git fetch upstream
+              
+              # Get default branches
               DEFAULT_BRANCH=$(git symbolic-ref --short HEAD || echo "main")
               echo "Default branch is $DEFAULT_BRANCH"
               
               UPSTREAM_DEFAULT=$(git ls-remote --symref upstream HEAD | grep -oP 'refs/heads/\K[^\s]+' || echo "main")
               echo "Upstream default branch is $UPSTREAM_DEFAULT"
               
-              git merge "upstream/$UPSTREAM_DEFAULT" -m "Sync with upstream"
+              # Merge changes
+              git merge "upstream/$UPSTREAM_DEFAULT" -m "Sync with upstream" || {
+                echo "Merge conflict detected. Will try with --allow-unrelated-histories"
+                git merge "upstream/$UPSTREAM_DEFAULT" --allow-unrelated-histories -m "Sync with upstream"
+              }
+              
+              # Push changes
               git push origin $DEFAULT_BRANCH
               
               echo "Successfully synced $repo"
