@@ -27,64 +27,62 @@ jobs:
   # ==============================================================
   # Job 1: List Forks and Gather Details
   # ==============================================================
-  list-forks:
-    name: 1. List Forks & Get Details
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    outputs:
-      # JSON array of objects with full details (for README)
-      forks_details_json: ${{ steps.get_forks.outputs.details_json }}
-      # JSON array of strings with just names (for batched sync)
-      forks_names_json: ${{ steps.get_forks.outputs.names_json }}
-      # Total count
-      forks_count: ${{ steps.get_forks.outputs.count }}
-    env:
-      GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
-      SPECIFIC_REPO: ${{ github.event.inputs.specific_repo }}
-      GH_REPO_OWNER: ${{ github.repository_owner }}
-    steps:
-      - name: Check gh CLI installation
-        run: gh --version
-      - name: Authenticate gh CLI for Git operations
-        run: gh auth setup-git
-      - name: Get list of forks with details
-        id: get_forks
-        run: |
-          repo_details_json="[]"
-          repo_names_json="[]"
-          repo_count=0
-          JSON_FIELDS="nameWithOwner,description,parent,primaryLanguage"
+ # In jobs.list-forks:
+# ... (env block as before) ...
+steps:
+  - name: Check gh CLI installation
+    run: gh --version
+  - name: Authenticate gh CLI for Git operations
+    run: gh auth setup-git
+  - name: Get list of forks with details
+    id: get_forks
+    run: |
+      # Add trace mode if further debugging is needed: set -x
+      repo_details_json="[]"
+      repo_names_json="[]"
+      repo_count=0
+      JSON_FIELDS="nameWithOwner,description,parent,primaryLanguage"
 
-          if [[ -n "$SPECIFIC_REPO" ]]; then
-            # --- Handle Specific Repo Input ---
-            target_repo="$SPECIFIC_REPO"
-            echo "Fetching details for specific repository: $target_repo"
-            if [[ "$target_repo" != */* ]]; then target_repo="$GH_REPO_OWNER/$target_repo"; echo "Assuming owner: $target_repo"; fi
-            fetched_details=$(gh repo view "$target_repo" --json $JSON_FIELDS | jq --compact-output '.')
-            if [[ -n "$fetched_details" && "$fetched_details" != "null" ]]; then
-               repo_details_json=$(echo "$fetched_details" | jq '[.]') # Wrap single object in array
-               repo_names_json=$(echo "$repo_details_json" | jq '[.[].nameWithOwner]') # Extract name into array
-               repo_count=1
-            else
-               echo "::error::Failed to fetch details for specific repo: $target_repo. Check name and permissions."
-            fi
-          else
-            # --- Handle Fetching All Forks ---
-            echo "Fetching all fork repositories for $GH_REPO_OWNER with details..."
-            # Fetch details for all forks. Using -q '.' outputs the raw JSON array.
-            repo_details_json=$(gh repo list "$GH_REPO_OWNER" --fork --limit 2000 --json $JSON_FIELDS -q '.')
-            repo_count=$(echo "$repo_details_json" | jq 'length')
-            # Extract just the names into a separate JSON array
-            repo_names_json=$(echo "$repo_details_json" | jq '[.[].nameWithOwner]')
-            echo "Found $repo_count forks."
-          fi
+      if [[ -n "$SPECIFIC_REPO" ]]; then
+        target_repo="$SPECIFIC_REPO"
+        echo "Fetching details for specific repository: $target_repo"
+        if [[ "$target_repo" != */* ]]; then target_repo="$GH_REPO_OWNER/$target_repo"; echo "Assuming owner: $target_repo"; fi
+        # Ensure output is compact JSON (no newlines within the JSON structure itself)
+        fetched_details=$(gh repo view "$target_repo" --json $JSON_FIELDS | jq --compact-output '.')
+        if [[ -n "$fetched_details" && "$fetched_details" != "null" ]]; then
+           repo_details_json=$(echo "$fetched_details" | jq --compact-output '[.]') # Wrap in array
+           repo_names_json=$(echo "$repo_details_json" | jq --compact-output '[.[].nameWithOwner]')
+           repo_count=1
+        else
+           echo "::error::Failed to fetch details for specific repo: $target_repo. Check name and permissions."
+        fi
+      else
+        echo "Fetching all fork repositories for $GH_REPO_OWNER with details..."
+        # Ensure output is compact JSON
+        repo_details_json=$(gh repo list "$GH_REPO_OWNER" --fork --limit 2000 --json $JSON_FIELDS | jq --compact-output '.')
+        repo_count=$(echo "$repo_details_json" | jq 'length')
+        repo_names_json=$(echo "$repo_details_json" | jq --compact-output '[.[].nameWithOwner]')
+        echo "Found $repo_count forks."
+      fi
 
-          if [[ "$repo_count" -eq 0 ]]; then echo "::warning::No repositories found to process."; fi
+      if [[ "$repo_count" -eq 0 ]]; then echo "::warning::No repositories found to process."; fi
 
-          # Output variables for subsequent jobs
-          echo "details_json=$repo_details_json" >> $GITHUB_OUTPUT
-          echo "names_json=$repo_names_json" >> $GITHUB_OUTPUT
-          echo "count=$repo_count" >> $GITHUB_OUTPUT
+      # --- Set Outputs using multi-line delimiter format ---
+      # This handles JSON strings potentially spanning multiple lines when pretty-printed,
+      # although --compact-output should minimize this. It's safer anyway.
+      echo "details_json<<EOF" >> $GITHUB_OUTPUT
+      echo "$repo_details_json" >> $GITHUB_OUTPUT
+      echo "EOF" >> $GITHUB_OUTPUT
+
+      echo "names_json<<EOF" >> $GITHUB_OUTPUT
+      echo "$repo_names_json" >> $GITHUB_OUTPUT
+      echo "EOF" >> $GITHUB_OUTPUT
+
+      # Count is single line, standard format is fine
+      echo "count=$repo_count" >> $GITHUB_OUTPUT
+
+      echo "Outputs generated." # Add confirmation log
+
 
   # ==============================================================
   # Job 2: Generate README.md (Check detailed logs for Exit Code 2)
