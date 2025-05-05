@@ -1,16 +1,22 @@
+# ======================================================================
 # Workflow Name: Appears in the Actions tab
+# ======================================================================
 name: Sync Forks and Update README (Batched)
 
+# ======================================================================
 # Triggers: When the workflow runs
+# ======================================================================
 on:
   schedule:
     # Runs every 12 hours (e.g., at 00:15 and 12:15 UTC)
+    # See https://crontab.guru/ for help. Adjust as needed.
+    # As of May 4, 2025: This schedule is set.
     - cron: '15 */12 * * *'
   workflow_dispatch:
     # Allows manual triggering via the Actions tab
     inputs:
       specific_repo:
-        description: 'Specific repository (owner/repo) to sync (leave empty for all forks)'
+        description: 'Optional: Specific repository (owner/repo) to sync (leave empty for all forks)'
         required: false
         type: string
       force_sync:
@@ -19,234 +25,287 @@ on:
         type: boolean
         default: false
 
-# Permissions: Define default permissions for the GITHUB_TOKEN for all jobs
+# ======================================================================
+# Permissions: Default permissions for GITHUB_TOKEN for all jobs
+# ======================================================================
 permissions:
+  # 'contents: write' allows:
+  # - Pushing changes to THIS repository (for the README update) using GITHUB_TOKEN
+  # - gh repo sync pushing changes to the FORKS (when using SYNC_TOKEN via env)
   contents: write
 
+# ======================================================================
+# Jobs: Define the workflow steps
+# ======================================================================
 jobs:
   # ==============================================================
   # Job 1: List Forks and Gather Details
   # ==============================================================
- # In jobs.list-forks:
-# ... (env block as before) ...
-steps:
-  - name: Check gh CLI installation
-    run: gh --version
-  - name: Authenticate gh CLI for Git operations
-    run: gh auth setup-git
-  - name: Get list of forks with details
-    id: get_forks
-    run: |
-      # Add trace mode if further debugging is needed: set -x
-      repo_details_json="[]"
-      repo_names_json="[]"
-      repo_count=0
-      JSON_FIELDS="nameWithOwner,description,parent,primaryLanguage"
+  list-forks:
+    name: 1. List Forks & Get Details
+    runs-on: ubuntu-latest
+    timeout-minutes: 15 # Increased slightly for large lists
+    outputs:
+      # Output the list of repo details as a JSON array string
+      forks_details_json: ${{ steps.get_forks.outputs.details_json }}
+      # Output the list of repo names as a JSON array string
+      forks_names_json: ${{ steps.get_forks.outputs.names_json }}
+      # Output the total count
+      forks_count: ${{ steps.get_forks.outputs.count }}
+    env:
+      # Use the dedicated SYNC_TOKEN for listing/viewing forks you own/manage
+      GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+      # Inputs from manual trigger
+      SPECIFIC_REPO: ${{ github.event.inputs.specific_repo }}
+      # Assumes forks are owned by the same entity running the action. Adjust if needed.
+      GH_REPO_OWNER: ${{ github.repository_owner }}
+    steps:
+      - name: Check Dependencies (gh, jq)
+        run: |
+          gh --version
+          jq --version
 
-      if [[ -n "$SPECIFIC_REPO" ]]; then
-        target_repo="$SPECIFIC_REPO"
-        echo "Fetching details for specific repository: $target_repo"
-        if [[ "$target_repo" != */* ]]; then target_repo="$GH_REPO_OWNER/$target_repo"; echo "Assuming owner: $target_repo"; fi
-        # Ensure output is compact JSON (no newlines within the JSON structure itself)
-        fetched_details=$(gh repo view "$target_repo" --json $JSON_FIELDS | jq --compact-output '.')
-        if [[ -n "$fetched_details" && "$fetched_details" != "null" ]]; then
-           repo_details_json=$(echo "$fetched_details" | jq --compact-output '[.]') # Wrap in array
-           repo_names_json=$(echo "$repo_details_json" | jq --compact-output '[.[].nameWithOwner]')
-           repo_count=1
-        else
-           echo "::error::Failed to fetch details for specific repo: $target_repo. Check name and permissions."
-        fi
-      else
-        echo "Fetching all fork repositories for $GH_REPO_OWNER with details..."
-        # Ensure output is compact JSON
-        repo_details_json=$(gh repo list "$GH_REPO_OWNER" --fork --limit 2000 --json $JSON_FIELDS | jq --compact-output '.')
-        repo_count=$(echo "$repo_details_json" | jq 'length')
-        repo_names_json=$(echo "$repo_details_json" | jq --compact-output '[.[].nameWithOwner]')
-        echo "Found $repo_count forks."
-      fi
+      - name: Authenticate gh CLI for Git operations
+        run: gh auth setup-git # Ensure git commands gh might invoke use the token
 
-      if [[ "$repo_count" -eq 0 ]]; then echo "::warning::No repositories found to process."; fi
+      - name: Get list of forks with details
+        id: get_forks
+        run: |
+          repo_details_json="[]"
+          repo_names_json="[]"
+          repo_count=0
+          # Define fields to fetch for the README table
+          JSON_FIELDS="nameWithOwner,description,parent,primaryLanguage"
 
-      # --- Set Outputs using multi-line delimiter format ---
-      # This handles JSON strings potentially spanning multiple lines when pretty-printed,
-      # although --compact-output should minimize this. It's safer anyway.
-      echo "details_json<<EOF" >> $GITHUB_OUTPUT
-      echo "$repo_details_json" >> $GITHUB_OUTPUT
-      echo "EOF" >> $GITHUB_OUTPUT
+          if [[ -n "$SPECIFIC_REPO" ]]; then
+            # --- Handle Specific Repo Input ---
+            target_repo="$SPECIFIC_REPO"
+            echo "Fetching details for specific repository: $target_repo"
+            # Prepend owner if not specified in input
+            if [[ "$target_repo" != */* ]]; then
+              target_repo="$GH_REPO_OWNER/$target_repo"
+              echo "Assuming owner: $target_repo"
+            fi
+            # Fetch details for the single specified repo using 'gh repo view'
+            # Use jq to ensure compact output and handle potential errors gracefully
+            fetched_details=$(gh repo view "$target_repo" --json $JSON_FIELDS | jq --compact-output '.' 2>/dev/null)
+            if [[ $? -eq 0 && -n "$fetched_details" && "$fetched_details" != "null" ]]; then
+               repo_details_json=$(echo "$fetched_details" | jq --compact-output '[.]') # Wrap single object in array
+               repo_names_json=$(echo "$repo_details_json" | jq --compact-output '[.[].nameWithOwner]') # Extract name into array
+               repo_count=1
+            else
+               echo "::error::Failed to fetch details for specific repo: $target_repo. Check name, permissions, and gh command output."
+               # Keep outputs as empty arrays/zero count
+            fi
+          else
+            # --- Handle Fetching All Forks ---
+            echo "Fetching all fork repositories for $GH_REPO_OWNER with details..."
+            # Fetch details for all forks using 'gh repo list'
+            # Increase --limit if needed. Note: Doesn't handle >5000 forks automatically (consider gh search or pagination).
+            # Use jq to ensure compact output
+            repo_details_json=$(gh repo list "$GH_REPO_OWNER" --fork --limit 5000 --json $JSON_FIELDS | jq --compact-output '.' 2>/dev/null)
+            if [[ $? -eq 0 && -n "$repo_details_json" ]]; then
+              repo_count=$(echo "$repo_details_json" | jq 'length')
+              # Extract just the names into a separate JSON array, ensure compact
+              repo_names_json=$(echo "$repo_details_json" | jq --compact-output '[.[].nameWithOwner]')
+              echo "Found $repo_count forks."
+            else
+               echo "::error::Failed to fetch fork list for $GH_REPO_OWNER. Check permissions and gh command output."
+               # Keep outputs as empty arrays/zero count
+            fi
+          fi
 
-      echo "names_json<<EOF" >> $GITHUB_OUTPUT
-      echo "$repo_names_json" >> $GITHUB_OUTPUT
-      echo "EOF" >> $GITHUB_OUTPUT
+          if [[ "$repo_count" -eq 0 ]]; then
+             echo "::warning::No repositories found to process."
+          fi
 
-      # Count is single line, standard format is fine
-      echo "count=$repo_count" >> $GITHUB_OUTPUT
+          # --- Set Outputs using multi-line delimiter format (robust way) ---
+          echo "details_json<<EOF" >> $GITHUB_OUTPUT
+          echo "$repo_details_json" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
 
-      echo "Outputs generated." # Add confirmation log
+          echo "names_json<<EOF" >> $GITHUB_OUTPUT
+          echo "$repo_names_json" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
 
+          # Count is single line, standard format is fine
+          echo "count=$repo_count" >> $GITHUB_OUTPUT
+
+          echo "Outputs generated (Count: $repo_count)."
 
   # ==============================================================
-  # Job 2: Generate README.md (Check detailed logs for Exit Code 2)
+  # Job 2: Generate README.md File
   # ==============================================================
   generate-readme:
     name: 2. Generate README File
-    needs: list-forks
+    needs: list-forks # Requires the list of forks output
+    # Only run if forks were actually found
     if: needs.list-forks.outputs.forks_count > 0
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # permissions: # Inherited from top-level
+    #   contents: write
     steps:
       - name: Checkout Workflow Repo
         uses: actions/checkout@v4
-        # Uses default GITHUB_TOKEN implicitly
+        # Uses the default GITHUB_TOKEN implicitly for checkout and push operations
+        # Ensure this token has write permissions (set at top level) and branch isn't protected against action pushes
 
       - name: Generate README content with detailed table
         id: generate
         run: |
-          # Add trace mode for debugging if needed: set -x
+          # For debugging push issues later, uncomment the next line:
+          # set -x
+
           echo "Generating README.md content..."
-          # Use the JSON with full details from list-forks
+          # Use the JSON with full details from list-forks job's output
           JSON_DATA='${{ needs.list-forks.outputs.forks_details_json }}'
           REPO_COUNT=${{ needs.list-forks.outputs.forks_count }}
+          # Dynamically get the path to this workflow file for linking
           WORKFLOW_FILE_PATH=".github/workflows/${{ github.workflow }}"
-          GENERATION_DATE=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          GENERATION_DATE=$(date -u +"%Y-%m-%d %H:%M:%S UTC") # Add timestamp
 
-          TEMP_README=$(mktemp)
+          TEMP_README=$(mktemp) # Use temp file for safe generation
+
+          # --- README Header ---
           echo "# Synced Fork Repositories" > "$TEMP_README"
           echo "" >> "$TEMP_README"
           echo "This file lists the **$REPO_COUNT** forked repositories managed by the [$WORKFLOW_FILE_PATH]($WORKFLOW_FILE_PATH) workflow." >> "$TEMP_README"
-          echo "_Last updated: $GENERATION_DATE_" >> "$TEMP_README"
+          echo "_List generated: $GENERATION_DATE_" >> "$TEMP_README"
           echo "" >> "$TEMP_README"
+
+          # --- Table Header ---
           echo "| Repository | Upstream | Language | Description |" >> "$TEMP_README"
           echo "|------------|----------|----------|-------------|" >> "$TEMP_README"
 
+          # --- Table Rows ---
+          # Use jq to process each object in the JSON array compactly (-c)
+          # Pipe it to a while loop reading each JSON object line by line
           echo "$JSON_DATA" | jq -c '.[]' | while IFS= read -r repo_obj; do
+            # Use jq again to extract fields from the current object ($repo_obj)
+            # Handle potential null values using // "N/A" or similar defaults
             repo_name=$(echo "$repo_obj" | jq -r '.nameWithOwner // "N/A"')
             repo_link="[$repo_name](https://github.com/$repo_name)"
+
             upstream_name=$(echo "$repo_obj" | jq -r '.parent.nameWithOwner // "N/A"')
-            upstream_link="N/A"; if [[ "$upstream_name" != "N/A" && "$upstream_name" != "null" ]]; then upstream_link="[$upstream_name](https://github.com/$upstream_name)"; fi
-            language=$(echo "$repo_obj" | jq -r '.primaryLanguage.name // "N/A"'); if [[ "$language" == "null" ]]; then language="N/A"; fi
-            description=$(echo "$repo_obj" | jq -r '.description // ""' | sed 's/|/\\|/g')
+            upstream_link="N/A"
+            if [[ "$upstream_name" != "N/A" && "$upstream_name" != "null" ]]; then
+               upstream_link="[$upstream_name](https://github.com/$upstream_name)"
+            fi
+
+            language=$(echo "$repo_obj" | jq -r '.primaryLanguage.name // "N/A"')
+            if [[ "$language" == "null" ]]; then language="N/A"; fi
+
+            description=$(echo "$repo_obj" | jq -r '.description // ""')
+            # Escape pipe characters in description to prevent breaking Markdown table
+            description=$(echo "$description" | sed 's/|/\\|/g')
+
+            # Append the formatted row to the temp file
             echo "| $repo_link | $upstream_link | $language | $description |" >> "$TEMP_README"
           done
+
+          # Overwrite the actual README.md file
           mv "$TEMP_README" README.md
-          echo "README.md generated."
+          echo "README.md generated locally."
 
       - name: Commit and Push README if changed
         run: |
-          # Add trace mode for debugging if needed: set -x
+          # For debugging push issues later, uncomment the next line:
+          # set -x
+
+          # Configure git user for the commit
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+
+          # Check if README.md has actual changes staged
           git add README.md
           if git diff --staged --quiet; then
             echo "No changes detected in README.md. Skipping commit."
-          else
-            echo "Changes detected in README.md. Committing..."
-            git commit -m "docs: Update list of synced forks (${{ needs.list-forks.outputs.forks_count }} repos)" -m "Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-            echo "Pushing changes..."
-            attempt=0; max_attempts=3; push_success=false
-            while [ $attempt -lt $max_attempts ]; do
-              attempt=$((attempt + 1))
-              if git push; then echo "Push successful on attempt $attempt."; push_success=true; break;
-              else
-                 echo "::warning::Push failed on attempt $attempt. Retrying in 15 seconds..."
-                 sleep 15
-                 echo "Pulling latest changes (rebase strategy)..."
-                 # Important: Use --ff-only pull or handle potential rebase conflicts if needed.
-                 # Simple pull might be safer if rebase causes issues. Let's try simple pull first.
-                 if ! git pull --ff-only; then # Try fast-forward only first
-                    echo "::warning::Fast-forward pull failed, attempting standard pull..."
-                    if ! git pull; then # If ff-only fails, try standard merge pull
-                       echo "::error::Pull failed. Cannot resolve conflicts automatically."
-                       # Decide if you want to fail here or attempt push anyway
-                       # exit 1 # Option: Fail the job if pull fails
-                    fi
+            exit 0 # Exit successfully if no changes
+          fi
+
+          # If changes exist:
+          echo "Changes detected in README.md. Committing..."
+          git commit -m "docs: Update list of synced forks (${{ needs.list-forks.outputs.forks_count }} repos)" -m "Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          echo "Pushing changes..."
+          # Retry push with backoff and simple pull (less prone to rebase issues)
+          attempt=0
+          max_attempts=3
+          push_success=false
+          while [ $attempt -lt $max_attempts ]; do
+            attempt=$((attempt + 1))
+            # Attempt push
+            if git push; then
+              echo "Push successful on attempt $attempt."
+              push_success=true
+              break
+            else
+              echo "::warning::Push failed on attempt $attempt. Retrying in 15 seconds..."
+              sleep 15
+              # Pull latest changes before retrying push. Use simple pull first.
+              echo "Pulling latest changes..."
+              if ! git pull --ff-only; then
+                 echo "::warning::Fast-forward pull failed, attempting standard merge pull..."
+                 if ! git pull; then
+                    echo "::error::Pull failed and could not merge. Cannot resolve conflicts automatically."
+                    # Fail here as push will likely fail again due to divergence
+                    exit 1
                  fi
               fi
-            done
-            if [ "$push_success" = false ]; then echo "::error::Failed to push README.md changes after $max_attempts attempts. Check logs and repository permissions/rules."; exit 1; fi
+            fi
+          done # End retry loop
+
+          if [ "$push_success" = false ]; then
+            echo "::error::Failed to push README.md changes after $max_attempts attempts. Check logs and repository permissions/rules (e.g., branch protection)."
+            exit 1 # Fail the step if push ultimately fails
           fi
 
-  # ==============================================================
-  # Job 3: Sync Forks in Batches (Handles > 256 forks)
-  # ==============================================================
-  sync-batches:
-    name: 3. Sync Batches
-    needs: list-forks
-    if: needs.list-forks.outputs.forks_count > 0
-    runs-on: ubuntu-latest
-    # Strategy: Generate batch numbers dynamically
-    strategy:
-      fail-fast: false # Don't stop other batches if one fails
-      matrix:
-        # This will be populated by the output of the 'generate_batches' step below
-        batch_index: [0] # Dummy value, will be replaced
-    outputs:
-      # Optional: Could output lists of successes/failures per batch
-      batch_result: ${{ steps.sync_batch_step.outputs.result }}
-
-    steps:
-      - name: Generate Batch Matrix
-        id: generate_batches
-        run: |
-          COUNT=${{ needs.list-forks.outputs.forks_count }}
-          BATCH_SIZE=50 # Adjust batch size as needed (50 * 12 batches = 600, well under 256 limit)
-          NUM_BATCHES=$(( (COUNT + BATCH_SIZE - 1) / BATCH_SIZE )) # Ceiling division
-          echo "Total Repos: $COUNT, Batch Size: $BATCH_SIZE, Num Batches: $NUM_BATCHES"
-          if [[ $NUM_BATCHES -eq 0 ]]; then
-            # Handle case with 0 repos if needed, though 'if' on job handles this
-             echo "matrix_config={\"include\":[]}" >> $GITHUB_OUTPUT
-          else
-            # Generate sequence [0, 1, ..., NUM_BATCHES-1] as JSON for the matrix input
-            MATRIX_JSON=$(jq -c -n --argjson max "$NUM_BATCHES" '[range(0;$max)]')
-            echo "matrix_config={\"batch_index\":$MATRIX_JSON}" >> $GITHUB_OUTPUT
-            # Example output: matrix_config={"batch_index":[0,1,2,3,4,5,6,7,8,9,10,11]}
-          fi
-      # The actual matrix strategy uses the output from the previous step
-      # This requires a bit of a workaround as strategy is evaluated early.
-      # We define a dummy matrix above and filter/run logic inside steps based on the calculated batches.
-      # A cleaner way requires more complex dynamic matrix generation often involving separate actions/workflows.
-      # Let's stick to the slicing logic *within* the job based on an index derived from the total count.
-      # --> Reverting to a simpler matrix generation if possible, or slicing within the job.
-
-      # --- Simpler Approach: Slice Within Job ---
-      # The strategy above is complex. Let's redefine the job to run ONCE,
-      # and calculate batches internally. This sacrifices parallelism between batches
-      # but avoids matrix complexity and the 256 limit directly.
-      # If parallelism between batches IS required, the dynamic matrix is needed.
-      # Let's assume sequential batch processing within ONE job is acceptable first.
-
-# =====================================================================
-# == REVISED Job 3: Process All Batches Sequentially in One Job ==
-# =====================================================================
+  # =====================================================================
+  # Job 3: Sync All Forks (Batched Sequential Processing)
+  # =====================================================================
   sync_all_forks_sequentially_batched:
     name: 3. Sync All Forks (Batched Sequential)
-    needs: list-forks
+    needs: list-forks # Requires the list of fork names
+    # Only run if forks were actually found
     if: needs.list-forks.outputs.forks_count > 0
     runs-on: ubuntu-latest
-    # Increase timeout significantly as this job processes ALL forks
-    timeout-minutes: 300 # 5 hours, adjust as needed up to 360 (6 hours)
+    # Increase timeout significantly as this job processes ALL forks sequentially
+    timeout-minutes: 360 # Max recommended (6 hours)
     env:
+      # Use the SYNC_TOKEN with permissions for the FORKED repositories
       GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+      # Input from manual trigger
       FORCE_SYNC: ${{ github.event.inputs.force_sync }}
     steps:
-      - name: Check gh CLI installation
-        run: gh --version
+      - name: Check Dependencies (gh, jq)
+        run: |
+          gh --version
+          jq --version
+
       - name: Configure Git User (Optional)
+        # Not strictly needed for `gh repo sync` but good practice if any git commands were added
         run: |
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+
       - name: Authenticate gh CLI for Git operations
         run: gh auth setup-git
 
       - name: Sync All Forks in Batches
         id: sync_step
         run: |
-          # Add trace mode for debugging if needed: set -x
+          # Add trace mode for debugging specific sync issues:
+          # set -x
+
+          # Retrieve the JSON array of *names* only
           JSON_NAMES='${{ needs.list-forks.outputs.forks_names_json }}'
           COUNT=${{ needs.list-forks.outputs.forks_count }}
-          BATCH_SIZE=50 # Process 50 forks at a time
+          BATCH_SIZE=50 # Adjust batch size if needed (lower might reduce blast radius of temp issues)
           FAILURES=0
           SUCCESSES=0
-          FAILED_REPOS=() # Array to hold names of failed repos
+          # Use bash associative array for slightly cleaner failed repo reporting
+          declare -A FAILED_REPOS
 
           echo "Starting sequential sync for $COUNT repositories in batches of $BATCH_SIZE..."
 
@@ -255,91 +314,171 @@ steps:
             # Ensure batch_end doesn't exceed total count
             if (( batch_end > COUNT )); then batch_end=$COUNT; fi
 
-            echo "--- Processing Batch: Repos ${batch_start} to $((batch_end - 1)) ---"
+            current_batch_number=$((batch_start / BATCH_SIZE + 1))
+            total_batches=$(( (COUNT + BATCH_SIZE - 1) / BATCH_SIZE ))
+            echo ""
+            echo "--- Processing Batch ${current_batch_number}/${total_batches} (Repos ${batch_start} to $((batch_end - 1))) ---"
+            echo ""
 
-            # Extract the names for the current batch
-            BATCH_NAMES_JSON=$(echo "$JSON_NAMES" | jq --argjson start "$batch_start" --argjson end "$batch_end" '.[$start:$end]')
+            # Extract the names for the current batch using jq slicing
+            BATCH_NAMES_JSON=$(echo "$JSON_NAMES" | jq --compact-output --argjson start "$batch_start" --argjson end "$batch_end" '.[$start:$end]')
 
             # Loop through repos in the current batch
             echo "$BATCH_NAMES_JSON" | jq -r '.[]' | while IFS= read -r repo_name; do
-              if [[ -z "$repo_name" || "$repo_name" == "null" ]]; then continue; fi # Skip empty names
+              # Handle potential null/empty values from jq extraction
+              if [[ -z "$repo_name" || "$repo_name" == "null" ]]; then
+                echo "::warning::Skipping invalid repository name in batch."
+                continue
+              fi
 
-              echo "--> Syncing $repo_name..."
-              attempt=0; max_attempts=3; delay=10; sync_success=false
-              sync_command="gh repo sync $repo_name"; if [[ "${{ env.FORCE_SYNC }}" == "true" ]]; then sync_command="$sync_command --force"; fi
+              echo "--> Syncing ${repo_name}..."
+              attempt=0
+              max_attempts=3
+              delay=10 # Start with 10s delay between retries
+              sync_success=false
 
+              # Base sync command
+              sync_command="gh repo sync ${repo_name}"
+              # Append --force flag if needed
+              if [[ "${{ env.FORCE_SYNC }}" == "true" ]]; then
+                sync_command="$sync_command --force"
+              fi
+
+              # Retry loop for individual repo sync
               while [ $attempt -lt $max_attempts ]; do
                 attempt=$((attempt + 1))
-                output=$( { $sync_command; } 2>&1 ); status=$?
-                if [ $status -eq 0 ]; then sync_success=true; echo "Sync successful for $repo_name."; echo "$output"; break; fi
-                echo "::warning::Sync attempt $attempt failed for $repo_name (Exit Code: $status). Output: $output"
-                if [ $attempt -ge $max_attempts ]; then echo "::error::Failed to sync $repo_name after $max_attempts attempts."; break; fi
-                echo "Waiting $delay seconds before retry..."; sleep $delay; delay=$((delay * 2))
-              done # End retry loop
+                # Execute command, capture stdout/stderr, get exit code
+                output=$( { $sync_command; } 2>&1 )
+                status=$?
 
+                if [ $status -eq 0 ]; then
+                  # Success (includes "already in sync" messages)
+                  sync_success=true
+                  echo "Sync command finished successfully for ${repo_name} (Exit Code: 0)."
+                  echo "$output" # Log output
+                  break # Exit retry loop
+                fi
+
+                # Failure
+                echo "::warning::Sync attempt $attempt failed for ${repo_name} (Exit Code: $status)."
+                echo "Output: $output"
+                if [ $attempt -ge $max_attempts ]; then
+                  echo "::error::Failed to sync ${repo_name} after $max_attempts attempts."
+                  # Store failure reason if possible (e.g., first line of output)
+                  error_summary=$(echo "$output" | head -n 1)
+                  FAILED_REPOS["$repo_name"]="$error_summary" # Store repo name and error summary
+                  break # Exit retry loop
+                fi
+                echo "Waiting $delay seconds before retry..."
+                sleep $delay
+                delay=$((delay * 2)) # Exponential backoff
+              done # End retry loop for one repo
+
+              # Update summary and counters based on outcome
               if [ "$sync_success" = true ]; then
                 SUCCESSES=$((SUCCESSES + 1))
-                echo "✅ Successfully processed $repo_name" >> $GITHUB_STEP_SUMMARY
+                echo "✅ Successfully processed ${repo_name}" >> $GITHUB_STEP_SUMMARY
               else
                 FAILURES=$((FAILURES + 1))
-                FAILED_REPOS+=("$repo_name") # Add to list of failures
-                echo "❌ Failed to sync $repo_name" >> $GITHUB_STEP_SUMMARY
-                 # Optionally add failure log snippet to summary here too
+                # Already added to FAILED_REPOS array above
+                echo "❌ Failed to sync ${repo_name}" >> $GITHUB_STEP_SUMMARY
               fi
               echo "-----------------------------------------"
-              # Optional: Add a small delay between repos within a batch
+              # Optional: Small delay between each repo sync call
               # sleep 1
-            done # End repo loop for batch
-            echo "--- Finished Batch: Repos ${batch_start} to $((batch_end - 1)) ---"
-             # Optional: Add a small delay between batches
-             # sleep 5
-          done # End batch loop
+            done # End repo loop for the current batch
 
+            echo "--- Finished Batch ${current_batch_number}/${total_batches} ---"
+             # Optional: Small delay between batches
+             # sleep 5
+          done # End batch loop for all batches
+
+          echo ""
           echo "--- Sync Process Complete ---"
           echo "Total Repos Processed: $COUNT"
           echo "Successful Syncs: $SUCCESSES"
           echo "Failed Syncs: $FAILURES"
-          echo "$SUCCESSES" >> $GITHUB_OUTPUT # Example output
-          echo "$FAILURES" >> $GITHUB_OUTPUT # Example output
+          echo ""
 
-          # Update Job Summary with failure list
+          # Set step outputs (example)
+          echo "success_count=$SUCCESSES" >> $GITHUB_OUTPUT
+          echo "failure_count=$FAILURES" >> $GITHUB_OUTPUT
+
+          # Update Job Summary with failure list details
           if [[ $FAILURES -gt 0 ]]; then
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "### Failed Repositories ($FAILURES):" >> $GITHUB_STEP_SUMMARY
-            printf -- '- %s\n' "${FAILED_REPOS[@]}" >> $GITHUB_STEP_SUMMARY
-            # Fail the step if any repo failed
+            echo "<details><summary><strong>Failed Repositories ($FAILURES):</strong></summary>" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            # Print key-value pairs from associative array
+            for failed_repo in "${!FAILED_REPOS[@]}"; do
+              echo "- **$failed_repo**: ${FAILED_REPOS[$failed_repo]}" >> $GITHUB_STEP_SUMMARY
+            done
+            echo "</details>" >> $GITHUB_STEP_SUMMARY
+
+            # Fail the step (and the job) if any repo sync failed after retries
             exit 1
           fi
-          # If no failures, exit successfully
+
+          # If loop completes with zero failures, exit successfully
           exit 0
 
   # ==============================================================
-  # Job 4: Final Summary Job
+  # Job 4: Final Workflow Summary Job
   # ==============================================================
   sync-summary:
     name: 4. Workflow Summary
-    # Depends on list-forks, generate-readme, and the new sync job
+    # Depends on the completion of list-forks, generate-readme, and the sequential sync job
     needs: [list-forks, generate-readme, sync_all_forks_sequentially_batched]
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    # Run even if preceding jobs failed/were skipped
+    # Crucially, run this even if preceding jobs failed/were skipped to provide final status
     if: always()
     steps:
       - name: Report Overall Status
         run: |
           echo "## Fork Sync & README Update Summary" >> $GITHUB_STEP_SUMMARY
-          echo "- Workflow Run ID: ${{ github.run_id }}" >> $GITHUB_STEP_SUMMARY
-          echo "- Triggered By: ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
-          echo "- Total Forks Found: ${{ needs.list-forks.outputs.forks_count }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Workflow Run ID: [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})" >> $GITHUB_STEP_SUMMARY
+          echo "- Triggered By: \`${{ github.event_name }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Total Forks Found: **${{ needs.list-forks.outputs.forks_count }}**" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
           # --- Report on README Job ---
           readme_outcome="${{ needs.generate-readme.result }}"
-          readme_status_msg="-"; if [[ "${{ needs.list-forks.outputs.forks_count }}" -gt 0 ]]; then case "$readme_outcome" in (success) readme_status_msg="✅ README update job completed successfully.";; (skipped) readme_status_msg="ℹ️ README update job skipped.";; (failure) readme_status_msg="⚠️ README update job failed. Check its logs.";; (cancelled) readme_status_msg="ℹ️ README update job cancelled.";; (*) readme_status_msg="ℹ️ README update job status: ${readme_outcome}.";; esac; else readme_status_msg="ℹ️ README update job skipped (no forks found)."; fi; echo "$readme_status_msg" >> $GITHUB_STEP_SUMMARY
+          readme_status_msg="-" # Default placeholder
+          # Check if the job was expected to run (forks_count > 0)
+          if [[ "${{ needs.list-forks.outputs.forks_count }}" -gt 0 ]]; then
+              case "$readme_outcome" in
+                success) readme_status_msg="✅ README update job completed successfully.";;
+                skipped) readme_status_msg="ℹ️ README update job skipped (likely no changes detected or condition not met).";;
+                failure) readme_status_msg="⚠️ README update job failed. Check its logs.";;
+                cancelled) readme_status_msg="ℹ️ README update job cancelled.";;
+                *) readme_status_msg="ℹ️ README update job status: \`${readme_outcome}\`.";;
+              esac
+          else
+              # If no forks found, the job has 'skipped' status because of the 'if' condition
+              readme_status_msg="ℹ️ README update job skipped (no forks found)."
+          fi
+          echo "$readme_status_msg" >> $GITHUB_STEP_SUMMARY
 
           # --- Report on Sync Job ---
           sync_outcome="${{ needs.sync_all_forks_sequentially_batched.result }}"
-          sync_status_msg="-"; if [[ "${{ needs.list-forks.outputs.forks_count }}" -gt 0 ]]; then case "$sync_outcome" in (success) sync_status_msg="✅ Sync job completed successfully (all forks processed without final error).";; (failure) sync_status_msg="⚠️ Sync job failed (one or more forks failed to sync). Check logs & summary.";; (cancelled) sync_status_msg="ℹ️ Sync job cancelled.";; (skipped) sync_status_msg="ℹ️ Sync job skipped.";; (*) sync_status_msg="ℹ️ Sync job status: ${sync_outcome}.";; esac; else sync_status_msg="ℹ️ Sync job skipped (no forks found)."; fi; echo "$sync_status_msg" >> $GITHUB_STEP_SUMMARY
+          sync_status_msg="-" # Default placeholder
+          # Check if the job was expected to run (forks_count > 0)
+          if [[ "${{ needs.list-forks.outputs.forks_count }}" -gt 0 ]]; then
+             case "$sync_outcome" in
+                success) sync_status_msg="✅ Sync job completed successfully (all forks processed without final error).";;
+                failure) sync_status_msg="⚠️ Sync job failed (one or more forks failed to sync). Check logs & summary.";;
+                cancelled) sync_status_msg="ℹ️ Sync job cancelled.";;
+                skipped) sync_status_msg="ℹ️ Sync job skipped.";;
+                *) sync_status_msg="ℹ️ Sync job status: \`${sync_outcome}\`.";;
+             esac
+          else
+              # If no forks found, the job has 'skipped' status because of the 'if' condition
+              sync_status_msg="ℹ️ Sync job skipped (no forks found)."
+          fi
+          echo "$sync_status_msg" >> $GITHUB_STEP_SUMMARY
 
+          # --- Add link to check details ---
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "*Check the 'Sync All Forks (Batched Sequential)' job logs and summary panel for per-repository status and failures.*" >> $GITHUB_STEP_SUMMARY
+          echo "*Check the '3. Sync All Forks (Batched Sequential)' job logs and summary panel for per-repository status and failures.*" >> $GITHUB_STEP_SUMMARY
+
