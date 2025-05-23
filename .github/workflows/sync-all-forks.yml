@@ -332,11 +332,46 @@ jobs:
           done
 
   # ==============================================================
-  # Job 3: Parallel Batch Sync Jobs
+  # Job 3: Create Batch Matrix
+  # ==============================================================
+  create-matrix:
+    name: 3a. Create Batch Matrix
+    needs: analyze-forks
+    if: needs.analyze-forks.outputs.sync_needed_count > 0
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.create_matrix.outputs.matrix }}
+    steps:
+      - name: Create batch matrix
+        id: create_matrix
+        run: |
+          batch_count=${{ needs.analyze-forks.outputs.batch_count }}
+          
+          if [[ $batch_count -eq 0 ]]; then
+            echo "matrix=[]" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # Create array of batch indices [0, 1, 2, ..., batch_count-1]
+          matrix="["
+          for ((i=0; i<batch_count; i++)); do
+            if [[ $i -gt 0 ]]; then
+              matrix+=","
+            fi
+            matrix+="$i"
+          done
+          matrix+="]"
+          
+          echo "Created matrix: $matrix"
+          echo "matrix=$matrix" >> $GITHUB_OUTPUT
+
+  # ==============================================================
+  # Job 4: Parallel Batch Sync Jobs
   # ==============================================================
   sync-batch:
-    name: 3. Sync Batch
-    needs: analyze-forks
+    name: 4. Sync Batch
+    needs: [analyze-forks, create-matrix]
     if: needs.analyze-forks.outputs.sync_needed_count > 0
     runs-on: ubuntu-latest
     timeout-minutes: 120
@@ -344,7 +379,7 @@ jobs:
       max-parallel: ${{ fromJson(github.event.inputs.max_parallel_jobs || '5') }}
       fail-fast: false
       matrix:
-        batch_index: ${{ fromJson(needs.analyze-forks.outputs.batch_count > 0 && format('[{0}]', join(fromJson(format('[{0}]', join(range(0, fromJson(needs.analyze-forks.outputs.batch_count)), ','))), ',')) || '[0]') }}
+        batch_index: ${{ fromJson(needs.create-matrix.outputs.matrix) }}
     env:
       GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
       FORCE_SYNC: ${{ github.event.inputs.force_sync }}
@@ -440,11 +475,11 @@ jobs:
           fi
 
   # ==============================================================
-  # Job 4: Final Summary
+  # Job 5: Final Summary
   # ==============================================================
   workflow-summary:
-    name: 4. Workflow Summary
-    needs: [analyze-forks, generate-readme, sync-batch]
+    name: 5. Workflow Summary
+    needs: [analyze-forks, generate-readme, create-matrix, sync-batch]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
